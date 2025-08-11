@@ -101,8 +101,6 @@ class ImageGPTImageProcessorFast(BaseImageProcessorFast):
         # Force base pipeline to skip its rescale/normalize validation and logic
         kwargs["do_rescale"] = False
         kwargs["do_normalize"] = False
-        # kwargs["image_mean"] = None
-        # kwargs["image_std"] = None
         return kwargs
 
     def _preprocess(
@@ -137,29 +135,26 @@ class ImageGPTImageProcessorFast(BaseImageProcessorFast):
                 raise ValueError("Clusters must be provided for color quantization.")
             clusters_torch = torch.as_tensor(clusters, dtype=torch.float32)
 
-            # Quantize each image to a flattened sequence (H*W,)
-            input_ids_list = []
+            # Helper for clarity: quantize a single image [C,H,W] -> [H*W]
+            def _quantize_one_image(image_chw: torch.Tensor, clusters_ref: torch.Tensor) -> torch.Tensor:
+                device_clusters = clusters_ref.to(image_chw.device, dtype=image_chw.dtype)
+                img_hwc = image_chw.permute(1, 2, 0)
+                pixels = img_hwc.reshape(-1, 3)
+                return color_quantize_torch(pixels, device_clusters)
+
             if isinstance(normalized, torch.Tensor):
-                batch = normalized
-                for img in batch:
-                    device_clusters = clusters_torch.to(img.device, dtype=img.dtype)
-                    hwc = img.permute(1, 2, 0)
-                    flat = hwc.reshape(-1, 3)
-                    ids = color_quantize_torch(flat, device_clusters)
-                    input_ids_list.append(ids)
-                input_ids = torch.stack(input_ids_list, dim=0)
-                pixel_values_out = batch
+                images_list = [img for img in normalized]
             else:
-                tmp_pixel_values = []
-                for img in normalized:
-                    device_clusters = clusters_torch.to(img.device, dtype=img.dtype)
-                    hwc = img.permute(1, 2, 0)
-                    flat = hwc.reshape(-1, 3)
-                    ids = color_quantize_torch(flat, device_clusters)
-                    input_ids_list.append(ids)
-                    tmp_pixel_values.append(img)
-                input_ids = input_ids_list if return_tensors is None else torch.stack(input_ids_list, dim=0)
-                pixel_values_out = tmp_pixel_values if return_tensors is None else torch.stack(tmp_pixel_values, dim=0)
+                images_list = list(normalized)
+
+            ids_list = [_quantize_one_image(img, clusters_torch) for img in images_list]
+
+            if return_tensors == "pt":
+                input_ids = torch.stack(ids_list, dim=0)
+                pixel_values_out = torch.stack(images_list, dim=0)
+            else:
+                input_ids = ids_list
+                pixel_values_out = images_list
 
             from ...image_processing_utils import BatchFeature
             return BatchFeature(data={"input_ids": input_ids, "pixel_values": pixel_values_out}, tensor_type=return_tensors)
@@ -177,11 +172,11 @@ class ImageGPTImageProcessorFast(BaseImageProcessorFast):
         # output["image_mean"] = None
         # output["image_std"] = None
         # No rescaling in fast ImageGPT path
+
+        #Need to set these valus to match with slow processor during testing
         output["rescale_factor"] = None
         output["do_rescale"] = None
-        # Ensure do_color_quantize key is present and consistent
         output["do_color_quantize"] = bool(getattr(self, "do_color_quantize", True))
-        # Drop private helper not meant for config persistence
         output.pop("_do_normalize_imagegpt", None)
         return output
 
