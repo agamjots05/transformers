@@ -14,6 +14,7 @@
 # limitations under the License.
 """Fast Image processor class for ImageGPT."""
 
+import numpy as np
 import torch
 from typing import Optional, Union
 
@@ -71,7 +72,7 @@ class ImageGPTImageProcessorFast(BaseImageProcessorFast):
     resample = PILImageResampling.BILINEAR
     size = {"height": 256, "width": 256}
     do_resize = True
-    # we can't utilizye basefastimage processor normalization/rescale as ImageGPT uses (x/127.5 - 1) or [-1,1] normalization
+    # We do NOT use the base normalization/rescale as ImageGPT expects (x/127.5 - 1)
     do_rescale = False
     do_normalize = False
 
@@ -80,73 +81,109 @@ class ImageGPTImageProcessorFast(BaseImageProcessorFast):
     
     def __init__(
         self,
-        clusters: Optional[Union[list, torch.Tensor]] = None,
+        clusters: Optional[Union[list, np.ndarray]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        # Convert clusters to torch tensor if provided
+        # Store clusters as numpy for JSON serializability. Convert to torch in _preprocess when needed.
         if clusters is not None:
-            if not isinstance(clusters, torch.Tensor):
-                clusters = torch.tensor(clusters, dtype=torch.float32)
-            self.clusters = clusters
+            self.clusters = np.asarray(clusters, dtype=np.float32)
         else:
             self.clusters = None
+        # Default: follow ImageGPT behavior (normalize by default). We stash here and force base to skip.
+        self._do_normalize_imagegpt = kwargs.get("do_normalize", True)
+
+    def _further_process_kwargs(self, **kwargs):
+        # Let the base process size/crop and other standard kwargs first
+        kwargs = super()._further_process_kwargs(**kwargs)
+        if "do_normalize" in kwargs and kwargs["do_normalize"] is not None:
+            self._do_normalize_imagegpt = kwargs["do_normalize"]
+        # Force base pipeline to skip its rescale/normalize validation and logic
+        kwargs["do_rescale"] = False
+        kwargs["do_normalize"] = False
+        # kwargs["image_mean"] = None
+        # kwargs["image_std"] = None
+        return kwargs
 
     def _preprocess(
         self,
-        images,  # List[torch.Tensor], each (C, H, W)
+        images,
         do_color_quantize: Optional[bool] = None,
-        clusters: Optional[Union[list, torch.Tensor]] = None,
+        clusters: Optional[Union[list, np.ndarray, torch.Tensor]] = None,
         return_tensors: Optional[str] = None,
         **kwargs
     ):
-        # Ensure the base class does resize/crop only
-       
+        # Run standard fast pipeline (resize, crop, batching) without rescale/normalize
         base_batch = super()._preprocess(images, return_tensors=return_tensors, **kwargs)
         pixel_values = base_batch["pixel_values"]  # Tensor [B,C,H,W] or list of [C,H,W]
 
-        # Convert to float and apply ImageGPT normalization: [-1, 1]
+        # Apply ImageGPT normalization when requested: [-1, 1]
+        do_normalize = getattr(self, "_do_normalize_imagegpt", True)
         if isinstance(pixel_values, torch.Tensor):
-            normalized = pixel_values.to(dtype=torch.float32) / 127.5 - 1.0
+            normalized = pixel_values.to(dtype=torch.float32)
+            if do_normalize:
+                normalized = normalized / 127.5 - 1.0
         else:
-            normalized = [img.to(dtype=torch.float32) / 127.5 - 1.0 for img in pixel_values]
+            normalized = [img.to(dtype=torch.float32) for img in pixel_values]
+            if do_normalize:
+                normalized = [img / 127.5 - 1.0 for img in normalized]
 
-        # If color quantization is requested, perform it; otherwise return normalized pixel values
+        # If color quantization is requested, perform it; otherwise return pixel values
         do_color_quantize = do_color_quantize if do_color_quantize is not None else self.do_color_quantize
         if do_color_quantize:
             # Prepare clusters
             clusters = clusters if clusters is not None else self.clusters
             if clusters is None:
                 raise ValueError("Clusters must be provided for color quantization.")
-            if not isinstance(clusters, torch.Tensor):
-                clusters = torch.tensor(clusters, dtype=torch.float32)
+            clusters_torch = torch.as_tensor(clusters, dtype=torch.float32)
 
             # Quantize each image to a flattened sequence (H*W,)
             input_ids_list = []
             if isinstance(normalized, torch.Tensor):
                 batch = normalized
                 for img in batch:
-                    device_clusters = clusters.to(img.device, dtype=img.dtype)
-                    hwc = img.permute(1, 2, 0) 
-                    flat = hwc.reshape(-1, 3)
-                    ids = color_quantize_torch(flat, device_clusters)
-                    input_ids_list.append(ids)
-                input_ids = torch.stack(input_ids_list, dim=0)
-            else:
-                for img in normalized:
-                    device_clusters = clusters.to(img.device, dtype=img.dtype)
+                    device_clusters = clusters_torch.to(img.device, dtype=img.dtype)
                     hwc = img.permute(1, 2, 0)
                     flat = hwc.reshape(-1, 3)
                     ids = color_quantize_torch(flat, device_clusters)
                     input_ids_list.append(ids)
+                input_ids = torch.stack(input_ids_list, dim=0)
+                pixel_values_out = batch
+            else:
+                tmp_pixel_values = []
+                for img in normalized:
+                    device_clusters = clusters_torch.to(img.device, dtype=img.dtype)
+                    hwc = img.permute(1, 2, 0)
+                    flat = hwc.reshape(-1, 3)
+                    ids = color_quantize_torch(flat, device_clusters)
+                    input_ids_list.append(ids)
+                    tmp_pixel_values.append(img)
                 input_ids = input_ids_list if return_tensors is None else torch.stack(input_ids_list, dim=0)
+                pixel_values_out = tmp_pixel_values if return_tensors is None else torch.stack(tmp_pixel_values, dim=0)
 
             from ...image_processing_utils import BatchFeature
-            return BatchFeature(data={"input_ids": input_ids}, tensor_type=return_tensors)
+            return BatchFeature(data={"input_ids": input_ids, "pixel_values": pixel_values_out}, tensor_type=return_tensors)
 
-        # Otherwise, return normalized pixel values
+        # Otherwise, return pixel values (normalized or not depending on flag)
         base_batch["pixel_values"] = normalized
         return base_batch
+
+    def to_dict(self):
+        # Convert numpy arrays to lists for JSON serialization
+        output = super().to_dict()
+        if output.get("clusters") is not None and isinstance(output["clusters"], np.ndarray):
+            output["clusters"] = output["clusters"].tolist()
+        # ImageGPT does not use base mean/std normalization; keep these None for parity with slow processor
+        # output["image_mean"] = None
+        # output["image_std"] = None
+        # No rescaling in fast ImageGPT path
+        output["rescale_factor"] = None
+        output["do_rescale"] = None
+        # Ensure do_color_quantize key is present and consistent
+        output["do_color_quantize"] = bool(getattr(self, "do_color_quantize", True))
+        # Drop private helper not meant for config persistence
+        output.pop("_do_normalize_imagegpt", None)
+        return output
 
 
 __all__ = ["ImageGPTImageProcessorFast"]
