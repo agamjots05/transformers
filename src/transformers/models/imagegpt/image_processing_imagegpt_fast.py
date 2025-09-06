@@ -105,7 +105,7 @@ class ImageGPTImageProcessorFast(BaseImageProcessorFast):
     image_mean = [0.5, 0.5, 0.5]
     image_std = [0.5, 0.5, 0.5]
     do_rescale = True
-    do_normalize = True
+    do_normalize = True 
 
     # We are keeping this for backwards compatibility
     def __init__(
